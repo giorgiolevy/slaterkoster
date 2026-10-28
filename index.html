@@ -330,7 +330,7 @@ tr:hover td{background:var(--accent-soft)}
       <div class="glyph">⬡</div>
       <div>
         <div class="t1">Slater–Koster</div>
-        <div class="t2">CIF → structure → H(k) → bands · v1.0.0</div>
+        <div class="t2">CIF → structure → H(k) → bands · v1.0.12</div>
       </div>
       <div class="spacer"></div>
       <button id="themeBtn" title="Switch day / night appearance" aria-label="Toggle theme">☾</button>
@@ -485,16 +485,18 @@ tr:hover td{background:var(--accent-soft)}
           </div>
         </div>
         <div class="pane">
-          <h3>Orbital per site
-            <label class="chk" style="margin-left:auto;font-size:12px"><input type="checkbox" id="showOrbitals"> show</label>
-          </h3>
+          <h3>Orbital per site</h3>
           <div class="pbody">
             <div class="row" style="margin-bottom:8px;align-items:center">
-              <span class="tiny">Pick an orbital per atom — drawn on the atom (visual only, does not change the model basis).</span>
+              <span class="tiny">Pick an orbital per atom — drawn on the atom (visual only, does not change the model basis).
+                Click a lit chip again to turn it off.</span>
+            </div>
+            <div id="orbViewWrap"><div id="orbViewList"></div></div>
+            <div class="row" id="orbViewFooter" style="margin-top:8px;align-items:center;display:none">
+              <span class="tiny" id="orbViewCount"></span>
               <span class="spacer" style="flex:1"></span>
               <button class="btn ghost" id="orbViewClear" style="padding:1px 10px;font-size:11px">clear all</button>
             </div>
-            <div id="orbViewWrap"><div id="orbViewList"></div></div>
           </div>
         </div>
       </div>
@@ -2551,8 +2553,11 @@ function drawOne(canvasId){
         else if(!isCentral) ctx.globalAlpha=0.55;
         const x=X(p), y=Y(p);
         // orbital overlay (behind the atom dot), only on the central cell
+        /* ORBITAL_VIEW is the single source of truth: a non-empty entry means
+           "show this orbital".  There used to be a separate "show" checkbox
+           gating this, which let a chip look selected while nothing was drawn. */
         const orbName = ORBITAL_VIEW.get(s.index);
-        if(orbName && isCentral && $('showOrbitals') && $('showOrbitals').checked){
+        if(orbName && isCentral){
           const saveA=ctx.globalAlpha;
           ctx.globalAlpha = (anySel && !isSel) ? 0.22 : 0.98;
           drawOrbitalGlyph(ctx, x, y, 34, orbName, window.__proj, elColor(s.el));
@@ -4591,11 +4596,22 @@ function renderOrbitalView(){
     ch.addEventListener('click',()=>{
       const idx=parseInt(ch.dataset.site,10);
       const orb=ch.dataset.orb;
+      /* clicking the chip that is already showing turns it OFF */
       if(ORBITAL_VIEW.get(idx)===orb) ORBITAL_VIEW.delete(idx);
       else ORBITAL_VIEW.set(idx,orb);
       renderOrbitalView(); draw();
     });
   });
+
+  /* The bulk-clear footer only appears when something is shown, so the control
+     is present exactly when it can do something (and never looks dead). */
+  const footer=$('orbViewFooter'), count=$('orbViewCount'), clearBtn=$('orbViewClear');
+  const n=ORBITAL_VIEW.size;
+  if(footer){
+    footer.style.display = n ? '' : 'none';
+    if(count) count.textContent = n===1 ? '1 orbital shown' : (n+' orbitals shown');
+  }
+  if(clearBtn) clearBtn.disabled = (n===0);
 }
 
 /* ---------- wiring ---------- */
@@ -4685,7 +4701,6 @@ $('includeSelf').addEventListener('change',run);
 $('autoCut').addEventListener('change',()=>{$('cutRange').disabled=$('autoCut').checked;run();});
 $('cutRange').addEventListener('input',()=>{$('cutV').textContent=parseFloat($('cutRange').value).toFixed(3)+' Å';if(!$('autoCut').checked)run();});
 ['showBonds','showLabels','showCell','showImages','planeSel','repeatSel'].forEach(id=>$(id).addEventListener('change',draw));
-if($('showOrbitals')) $('showOrbitals').addEventListener('change',()=>{ renderOrbitalView(); draw(); });
 if($('orbViewClear')) $('orbViewClear').addEventListener('click',()=>{ ORBITAL_VIEW.clear(); renderOrbitalView(); draw(); });
 $('basisSel').addEventListener('change',()=>{run();});
 /* k-point inputs (fractions of the reciprocal lattice vectors) */
