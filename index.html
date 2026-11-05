@@ -3,7 +3,7 @@
   Slater-Koster model builder
    --------------------------
 
-  Version: 1.0.0
+  Version: 1.0.15
 
   A single-file, dependency-free Slater-Koster model builder.  Load a
   structure (CIF, e.g. exported from CrystalViewer), pick an orbital basis,
@@ -330,7 +330,7 @@ tr:hover td{background:var(--accent-soft)}
       <div class="glyph">⬡</div>
       <div>
         <div class="t1">Slater–Koster</div>
-        <div class="t2">CIF → structure → H(k) → bands · v1.0.12</div>
+        <div class="t2">CIF → structure → H(k) → bands · v1.0.15</div>
       </div>
       <div class="spacer"></div>
       <button id="themeBtn" title="Switch day / night appearance" aria-label="Toggle theme">☾</button>
@@ -1285,15 +1285,32 @@ function buildModelJSON(){
   const basis=[];
   for(const s of mst.sites) for(let a=0;a<s.orbitals.length;a++){
     const o=s.orbitals[a];
-    basis.push({index:s.orbOffset+a, site:s.index, element:s.el, orbital:o.name, l:o.l, m:o.m});
+    basis.push({index:s.orbOffset+a, site:s.index, element:s.el, orbital:o.name, l:o.l, m:o.m,
+                f:s.f.slice()});
   }
+  // atom positions, so a consumer can group orbitals into layers: the height
+  // along a surface normal n is f.n (n an integer lattice direction)
+  const sitesOut=mst.sites.map(s=>({index:s.index, element:s.el, f:s.f.slice(), r:s.r.slice()}));
   // on-site energies (diagonal, R = 0)
   const onsite=[];
   for(const s of mst.sites) for(let a=0;a<s.orbitals.length;a++){
     const o=s.orbitals[a];
     onsite.push({index:s.orbOffset+a, value:params.onsite(s,o)});
   }
-  // hopping terms: same loops as prepareHk, but keep R as INTEGER lattice shifts
+  // hopping terms: same loops as prepareHk, but keep R as INTEGER lattice shifts.
+  // Each term is linear in the SK integrals, so its decomposition is exact:
+  // probe one integral at a time with all others zero.
+  const VKEYS=Object.keys(params.V||{});
+  const zeroV={}; for(const k of VKEYS) zeroV[k]=0;
+  const termParts=(oa,oc,lmn)=>{
+    const out=[];
+    for(const k of skChannelKeys(oa.l,oc.l)){
+      const V1=Object.assign({},zeroV); V1[k]=1;
+      const g=skIntegral(oa.l,oa.m,oc.l,oc.m,lmn,V1);
+      if(Math.abs(g)>1e-12) out.push({kind:k,g:g});
+    }
+    return out;
+  };
   const terms=[];
   for(const b of mnb.bonds){
     const si=mst.sites[b.i], sj=mst.sites[b.j];
@@ -1303,17 +1320,23 @@ function buildModelJSON(){
         const oc=sj.orbitals[c];
         const hop=skIntegral(oa.l,oa.m,oc.l,oc.m,b.lmn,params.V);
         if(hop===0) continue;
-        terms.push({row:si.orbOffset+a, col:sj.orbOffset+c, R:[b.R[0],b.R[1],b.R[2]], t:hop});
+        terms.push({row:si.orbOffset+a, col:sj.orbOffset+c, R:[b.R[0],b.R[1],b.R[2]], t:hop,
+                    parts:termParts(oa,oc,b.lmn)});
       }
     }
   }
   const cell=mst.cell;   // rows a1,a2,a3 in Angstrom
   return {
-    format:'skbuilder-model', version:1,
-    comment:'H(k)[r][c] = onsite[r]*delta + sum_t t*exp(2*pi*i*(f.R)), f = fractional k. Indices are 0-based.',
+    format:'skbuilder-model', version:4,
+    comment:'H(k)[r][c] = onsite[r]*delta + sum_t t*exp(2*pi*i*(f.R)), f = fractional k. Indices are 0-based. basis[].f and sites[].f are the fractional position of the atom hosting the orbital; the height along a surface normal n is f.n. surfaceNormal is the stacking direction when the structure was reoriented with the vacuum along z. nElectrons is the valence-electron count of the cell, for placing the Fermi level. terms[].parts lists the Slater-Koster integrals that build the term, t = sum_kind parameters.V[kind]*g, so a consumer can rescale a single integral.',
     nOrbitals:n,
     cell:cell.map(r=>r.slice()),
     cellParams:mst.cellParams||null,
+    sites:sitesOut,
+    surfaceNormal:mst.reoriented?[0,0,1]:null,
+    nElectrons:cellValenceElectrons(mst),
+    parameters:{V:Object.assign({},params.V||{}),
+                ranges:{V:{min:-8,max:8,step:0.02}, onsite:{min:-40,max:10,step:0.1}}},
     basis:basis,
     onsite:onsite,
     terms:terms,
