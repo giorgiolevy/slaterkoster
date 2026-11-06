@@ -330,7 +330,7 @@ tr:hover td{background:var(--accent-soft)}
       <div class="glyph">⬡</div>
       <div>
         <div class="t1">Slater–Koster</div>
-        <div class="t2">CIF → structure → H(k) → bands · v1.0.15</div>
+        <div class="t2">CIF → structure → H(k) → bands · v1.0.16</div>
       </div>
       <div class="spacer"></div>
       <button id="themeBtn" title="Switch day / night appearance" aria-label="Toggle theme">☾</button>
@@ -563,6 +563,14 @@ tr:hover td{background:var(--accent-soft)}
               <span class="spacer" style="flex:1"></span>
               <button class="btn" id="recomputeBtn" style="padding:3px 12px" disabled>Recompute</button>
               <span class="tiny" id="basisDirtyNote"></span>
+            </div>
+            <div class="row" style="margin-bottom:8px;align-items:center;gap:6px">
+              <span class="tiny">select</span>
+              <select id="selAtom" style="width:auto" title="Atom (element) filter for the All/None buttons"></select>
+              <select id="selShell" style="width:auto" title="Orbital filter (shell or individual orbital) for the All/None buttons"></select>
+              <button class="btn" id="selAll" style="padding:2px 10px" title="Select every state matching the filter">All</button>
+              <button class="btn ghost" id="selNone" style="padding:2px 10px" title="Deselect every state matching the filter">None</button>
+              <span class="tiny" id="selCount"></span>
             </div>
             <div id="statesOut"></div>
           </div>
@@ -2054,6 +2062,14 @@ function run(){
   ORBITAL_VIEW.clear(); // orbital overlay is per-structure too
   ST=buildStructure(text,{shells});
   ORBS=orbitalList(ST);
+  // Large bases: recomputing on every state toggle is slow, so start in
+  // manual mode unless the user has already chosen for this structure.
+  if(!AUTO_BASIS_TOUCHED){
+    const big=ST.nOrbitals>AUTO_RECOMPUTE_MAX_STATES;
+    $('autoBasis').checked=!big;
+    BASIS_AUTO_OFF=big;
+  }
+  updateBasisDirtyUI();
   elColorMap={};
   const auto=$('autoCut').checked;
   const opts={includeSelfImages:$('includeSelf').checked};
@@ -2090,9 +2106,12 @@ function run(){
   syncParams();      // rebuild the parameter sliders for the new basis/model
   // Compute the bands FIRST, so the Model tab (H(k), state chips, counts) is
   // rendered against the fresh LASTBANDS rather than the previous structure's.
-  renderBands(true); // new deck/basis → re-fit the energy window
+  // Quick low-resolution pass first, full resolution after a short idle: a
+  // large basis no longer blocks the UI while the plot is computed.
+  renderBands(true,true); // new deck/basis → re-fit the energy window
   renderModel();
   draw();
+  scheduleFullRender();
 }
 
 function syncParams(){
@@ -4060,9 +4079,16 @@ const HIDDEN_STATES=new Set(); // keys "site:orbIndex" excluded from the basis
    NOT the behaviour: auto is on so small systems stay live.  For large cells
    the user can turn it off and press Recompute once after picking a basis. */
 let BASIS_DIRTY=false;
+const AUTO_RECOMPUTE_MAX_STATES=24; // above this, start in manual mode
+let AUTO_BASIS_TOUCHED=false;       // true once the user flips the checkbox
+let BASIS_AUTO_OFF=false;           // auto was turned off by the size policy
 function basisAutoRecompute(){
   const el=$('autoBasis');
   return !el || el.checked;
+}
+function resetBasisAutoPolicy(){
+  AUTO_BASIS_TOUCHED=false;
+  BASIS_AUTO_OFF=false;
 }
 function markBasisDirty(){
   BASIS_DIRTY=true;
@@ -4072,13 +4098,15 @@ function updateBasisDirtyUI(){
   const btn=$('recomputeBtn');
   if(btn) btn.disabled=!BASIS_DIRTY;
   const note=$('basisDirtyNote');
-  if(note) note.textContent=BASIS_DIRTY?'basis changed \u2014 press Recompute':'';
+  if(note) note.textContent=BASIS_DIRTY?'basis changed \u2014 press Recompute':
+    (BASIS_AUTO_OFF?'auto recompute off (large basis)':'');
 }
 function recomputeBasis(){
   BASIS_DIRTY=false;
   updateBasisDirtyUI();
-  renderBands(true,false);   // full-resolution pass (basis change -> re-fit E)
+  renderBands(true,true);    // quick pass, full resolution follows after idle
   renderModel();
+  scheduleFullRender();
 }
 /* ===========================================================================
    SYMBOLIC H(k)
@@ -4428,6 +4456,102 @@ function kFracLabel(){
   return 'k = '+s+special;
 }
 
+/* ---------------------------------------------------------------- state filter
+   The two selects pick an atom (element) and an orbital shell; All/None apply
+   the selection to the matching states only.  Both default to "All", so the
+   buttons act on the whole basis. */
+function shellLabel(l){ return 'spdf'[l] || ('l='+l); }
+
+/* The orbital filter accepts a whole shell ("p", "d") or one orbital name
+   ("p_x", "d_xy", ...).  Shell labels are single letters; orbital names are
+   longer, so the two never collide (the s orbital is called "s"). */
+function orbitalMatches(o, sel){
+  if(sel==='all') return true;
+  if(sel==='s'||sel==='p'||sel==='d'||sel==='f') return shellLabel(o.l)===sel;
+  return o.name===sel;
+}
+
+/* Canonical order for the individual orbitals in the dropdown. */
+const ORBITAL_ORDER=['s','p_x','p_y','p_z','d_xy','d_yz','d_z2','d_xz','d_x2-y2','f'];
+
+function updateSelCount(){
+  if(!$('selCount')) return;
+  const fullSt=modelStructure($('modelSel').value);
+  const el=$('selAtom')?$('selAtom').value:'all';
+  const sh=$('selShell')?$('selShell').value:'all';
+  let n=0;
+  for(const s of fullSt.sites){
+    if(el!=='all' && s.el!==el) continue;
+    for(const o of s.orbitals) if(orbitalMatches(o,sh)) n++;
+  }
+  $('selCount').textContent=n?`${n} state${n===1?'':'s'}`:'no match';
+}
+
+function renderStateFilter(fullSt){
+  const atomSel=$('selAtom'), shellSel=$('selShell');
+  if(!atomSel || !shellSel) return;
+  const atoms=[...new Set(fullSt.sites.map(s=>s.el))];
+  // group the orbital names present in the basis by shell
+  const byShell=new Map();
+  for(const s of fullSt.sites) for(const o of s.orbitals){
+    if(!byShell.has(o.l)) byShell.set(o.l,new Set());
+    byShell.get(o.l).add(o.name);
+  }
+  const shells=[...byShell.keys()].sort((a,b)=>a-b);
+  const atomPrev=atomSel.value||'all', shellPrev=shellSel.value||'all';
+  atomSel.innerHTML='<option value="all">All atoms</option>'+
+    atoms.map(a=>`<option value="${a}">${a}</option>`).join('');
+  let html='<option value="all">All orbitals</option>';
+  for(const l of shells){
+    const label=shellLabel(l);
+    const names=[...byShell.get(l)].sort((a,b)=>{
+      const ia=ORBITAL_ORDER.indexOf(a), ib=ORBITAL_ORDER.indexOf(b);
+      return ((ia<0?999:ia)-(ib<0?999:ib)) || a.localeCompare(b);
+    });
+    html+=`<optgroup label="${label}">`;
+    html+=`<option value="${label}">${label} (all)</option>`;
+    if(names.length>1) for(const n of names) html+=`<option value="${n}">${n}</option>`;
+    html+='</optgroup>';
+  }
+  shellSel.innerHTML=html;
+  atomSel.value=(atomPrev==='all'||atoms.includes(atomPrev))?atomPrev:'all';
+  const shellVals=[...shellSel.options].map(o=>o.value);
+  shellSel.value=(shellPrev==='all'||shellVals.includes(shellPrev))?shellPrev:'all';
+  updateSelCount();
+}
+
+function bulkSelect(select){
+  const fullSt=modelStructure($('modelSel').value);
+  const el=$('selAtom').value, sh=$('selShell').value;
+  let changed=0;
+  for(const s of fullSt.sites){
+    if(el!=='all' && s.el!==el) continue;
+    for(let oi=0;oi<s.orbitals.length;oi++){
+      const o=s.orbitals[oi];
+      if(!orbitalMatches(o,sh)) continue;
+      const key=s.index+':'+oi;
+      if(select) HIDDEN_STATES.delete(key); else HIDDEN_STATES.add(key);
+      changed++;
+    }
+  }
+  if(!changed) return;
+  // reflect the change in the chips immediately
+  $('statesOut').querySelectorAll('input[type=checkbox]').forEach(cb=>{
+    cb.checked=!HIDDEN_STATES.has(cb.dataset.key);
+    const chip=cb.closest('.statechip');
+    if(chip) chip.classList.toggle('off',!cb.checked);
+  });
+  const mst=filterStructureByStates(fullSt);
+  $('basisNote').textContent=`${mst.nOrbitals} of ${fullSt.nOrbitals} states`;
+  if(basisAutoRecompute()){
+    renderBands(false,true);
+    renderModel();
+    scheduleFullRender();
+  } else {
+    markBasisDirty();
+  }
+}
+
 function renderModel(){
   if(!LASTBANDS){$('hkOut').innerHTML='<p class="hint">Load a deck first.</p>';return;}
   const {mst,mnb,params,kpts}=LASTBANDS;   // mst is already state-filtered
@@ -4491,6 +4615,7 @@ function renderModel(){
   // Reflect the selection count; when auto-recompute is off and the selection
   // differs from what is currently plotted, mark the basis dirty.
   $('basisNote').textContent=`${nSel} of ${nTot} states`;
+  renderStateFilter(fullSt);
   $('statesOut').querySelectorAll('input[type=checkbox]').forEach(cb=>{
     cb.addEventListener('change',()=>{
       const key=cb.dataset.key;
@@ -4675,6 +4800,7 @@ $('deckSel').addEventListener('change',()=>{
   CURRENT_CIF=null; CURRENT_CIF_NAME=null; $('importNote').textContent='';
   $('deckSel').dataset.prevDeck=v;
   fillDeckSel(v);   // refresh the imported-file entry (drop it)
+  resetBasisAutoPolicy();
   run();
 });
 /* CIF import (e.g. exported from CrystalViewer with symmetry operations) */
@@ -4694,6 +4820,7 @@ $('cifFile').addEventListener('change',e=>{
       CURRENT_CIF_NAME=f.name;
       $('importNote').textContent=f.name;
       fillDeckSel(DECK_IMPORTED);    // add/select the imported-file entry
+      resetBasisAutoPolicy();
       run();
       // report what symmetry was found
       const n=ST.hasSymmetry?ST.symops.length:0;
@@ -4748,9 +4875,15 @@ $('modelSel').addEventListener('change',()=>{syncParams();renderBands(true);rend
 /* Basis-recompute mode: auto (live) vs manual (press Recompute).  Turning auto
    back on while a change is pending applies it immediately. */
 if($('autoBasis')) $('autoBasis').addEventListener('change',()=>{
+  AUTO_BASIS_TOUCHED=true;
+  BASIS_AUTO_OFF=false;
   updateBasisDirtyUI();
   if(basisAutoRecompute() && BASIS_DIRTY) recomputeBasis();
 });
+if($('selAll')) $('selAll').addEventListener('click',()=>bulkSelect(true));
+if($('selNone')) $('selNone').addEventListener('click',()=>bulkSelect(false));
+if($('selAtom')) $('selAtom').addEventListener('change',updateSelCount);
+if($('selShell')) $('selShell').addEventListener('change',updateSelCount);
 if($('recomputeBtn')) $('recomputeBtn').addEventListener('click',()=>{ recomputeBasis(); });
 $('pathSel').addEventListener('change',()=>{if($('pathSel').value!=='custom')CUSTOM_PATH=null;renderBands(true);drawBZ();});
 $('perSeg').addEventListener('change',()=>{renderBands(true);});
