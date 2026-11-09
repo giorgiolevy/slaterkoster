@@ -330,7 +330,7 @@ tr:hover td{background:var(--accent-soft)}
       <div class="glyph">⬡</div>
       <div>
         <div class="t1">Slater–Koster</div>
-        <div class="t2">CIF → structure → H(k) → bands · v1.0.16</div>
+        <div class="t2">CIF → structure → H(k) → bands · v1.0.17</div>
       </div>
       <div class="spacer"></div>
       <button id="themeBtn" title="Switch day / night appearance" aria-label="Toggle theme">☾</button>
@@ -543,6 +543,7 @@ tr:hover td{background:var(--accent-soft)}
             </select>
             <label class="tiny">k-points / segment</label>
             <input type="number" id="perSeg" value="60" min="8" max="240" step="4" style="width:74px">
+            <label class="chk" style="margin:0;font-size:12px" title="Diagonalise H(k) in Web Workers (one per CPU core). On by default for large bases when the page is served over http(s); untick to use one thread."><input type="checkbox" id="useWorkers"> parallel</label>
             <button class="btn ghost" id="bzReset">Reset path</button>
           </div>
           <div id="bzInfo" style="margin-top:8px"></div>
@@ -752,6 +753,30 @@ function parseSymopXYZ(s){
   }
   return {M,c};
 }
+/* A CIF atom list is normally the asymmetric unit.  Apply the symmetry
+   operations and merge the images so the model is the full cell: without this
+   the structure is a fragment (missing atoms, missing bonds, and the slab
+   detector sees a vacuum that is not there).  A CIF that already lists the
+   full cell is unchanged by the merge. */
+function expandAtomsBySymmetry(atoms, symops){
+  if(!symops || symops.length<=1) return atoms.map(a=>({el:a.el,f:a.f.slice()}));
+  const cand=[];
+  for(const at of atoms){
+    for(const op of symops){
+      const f=wrapFrac(applySymop(op,at.f));
+      cand.push({el:at.el,f});
+    }
+  }
+  cand.sort((p,q)=>p.el.localeCompare(q.el)||p.f[0]-q.f[0]||p.f[1]-q.f[1]||p.f[2]-q.f[2]);
+  const out=[];
+  for(const c of cand){
+    const last=out[out.length-1];
+    if(last && last.el===c.el && fracEq(last.f,c.f,1e-3)) continue;
+    out.push(c);
+  }
+  return out;
+}
+
 function latticeFromParams({a,b,c,alpha,beta,gamma}){
   const D=Math.PI/180;
   const ca=Math.cos(alpha*D),cb=Math.cos(beta*D),cg=Math.cos(gamma*D);
@@ -840,8 +865,16 @@ function buildStructure(text,opts){
   const parsed=parseCIF(text);
   const cell=latticeFromParams(parsed.cellParams);
   if(!cell)throw new Error('invalid or degenerate cell parameters');
+  // parse the symmetry operations before building the sites: the CIF atom
+  // list is the asymmetric unit, so the full cell is its symmetry orbit.
+  const symops=[];
+  for(const raw of (parsed.symopsRaw||[])){
+    const op=parseSymopXYZ(raw);
+    if(op)symops.push(op);
+  }
+  const atoms=expandAtomsBySymmetry(parsed.atoms,symops);
   const shells=opts.shells||{};
-  const sites=parsed.atoms.map((at,idx)=>{
+  const sites=atoms.map((at,idx)=>{
     const ls=shells[at.el]!==undefined?shells[at.el]:defaultShells(at.el);
     const orbs=[];
     for(const l of ls)for(const o of ORBITAL_SHELLS[l])orbs.push(o);
@@ -849,13 +882,8 @@ function buildStructure(text,opts){
   });
   let g=0;
   for(const s of sites){s.orbOffset=g;g+=s.orbitals.length;}
-  // parse any symmetry operations carried by the CIF (e.g. exported by CrystalViewer)
-  const symops=[];
-  for(const raw of (parsed.symopsRaw||[])){
-    const op=parseSymopXYZ(raw);
-    if(op)symops.push(op);
-  }
   return {cell,sites,nOrbitals:g,cellParams:parsed.cellParams,
+          nAsym:parsed.atoms.length,
           symops, hmSymbol:parsed.hmSymbol||null, itNumber:parsed.itNumber||null,
           hasSymmetry:symops.length>1, twoD:parsed.twoD||null};
 }
@@ -1160,6 +1188,21 @@ function ddInt(da,db,mn,V){ return _bondInt(2,da,2,db,mn,V); }
    must not route them here. */
 function _bondInt(l1,m1,l2,m2,mn,V){
   if((l1<1||l1>2)||(l2<1||l2>2)) return 0;   // only p/d pairs; see note above
+  // The two-centre integral is a polynomial of degree l1+l2 in the bond
+  // direction: E(-n) = (-1)^(l1+l2) E(n).  The bond-frame rotation is a
+  // proper rotation and does not supply that sign, so canonicalise the
+  // direction and apply the parity explicitly.  This also makes the reverse
+  // bond in the term list Hermitian.
+  let sign = 1;
+  for (let i = 0; i < 3; i++) {
+    if (Math.abs(mn[i]) > 1e-12) {
+      if (mn[i] < 0) {
+        mn = [-mn[0], -mn[1], -mn[2]];
+        if (((l1 + l2) & 1) === 1) sign = -1;
+      }
+      break;
+    }
+  }
   const R=_rotToBond(mn);
   const C=_bondFrameCoeffs(R);
   const ia=_orbIndex(l1,m1), ib=_orbIndex(l2,m2);
@@ -1189,7 +1232,7 @@ function _bondInt(l1,m1,l2,m2,mn,V){
       e += C[ia][b1]*_channelV(l1,l2,ch1,V)*C[ib][b2];
     }
   }
-  return e;
+  return sign*e;
 }
 /* (lmnP removed: superseded by pComp) */
 /* Precompute the k-independent part of H(k): the on-site diagonal and a flat
@@ -1254,15 +1297,9 @@ function buildHk(ST,NB,params,k){
     re[idx]+=hop*cr;
     im[idx]+=hop*ci;
   }
-  // Hermitise
-  for(let r=0;r<n;r++){
-    for(let cc=r+1;cc<n;cc++){
-      const a=r*n+cc, b=cc*n+r;
-      const reh=0.5*(re[a]+re[b]), imh=0.5*(im[a]-im[b]);
-      re[a]=reh; im[a]=imh; re[b]=reh; im[b]=-imh;
-    }
-    im[r*n+r]=0;
-  }
+  // The term list is Hermitian (skIntegral satisfies E_ba(-n)=E_ab(n));
+  // do not average the two triangles, which would cancel a wrong reverse term.
+  for(let r=0;r<n;r++) im[r*n+r]=0;
   return {re,im,n,at:(i)=>re[i]};   // flat arrays; see hermitianEigenvaluesF
 }
 /* Eigenvalues from the flat re/im form (the hot path). */
@@ -1557,7 +1594,10 @@ function latticeClass(cellParams){
   const {a,b,c,alpha,beta,gamma}=cellParams;
   const near=(x,y,tol)=>Math.abs(x-y)<(tol||0.5);
   const r90=v=>near(v,90,0.5);
-  const eq2=(x,y)=>near(x,y,0.02*Math.max(x,y));
+  // 0.5 % on the lengths: a real orthorhombic distortion (Y124: a=3.84,
+  // b=3.87 A, 0.8 %) must not be rounded to tetragonal.  CIF cells that are
+  // exactly tetragonal agree to ~1e-4, so this is still generous.
+  const eq2=(x,y)=>near(x,y,0.005*Math.max(x,y));
   const allEq=eq2(a,b)&&eq2(b,c);
   const twoEq=(eq2(a,b)||eq2(b,c)||eq2(a,c));
   if(r90(alpha)&&r90(beta)&&r90(gamma)){
@@ -1624,12 +1664,17 @@ function detectSlab(ST, NB){
   // slab thickness = extent of atoms along the long axis (in that axis units)
   let mn=Infinity,mx=-Infinity;
   for(const s of ST.sites){const f=s.f[longest];if(f<mn)mn=f;if(f>mx)mx=f;}
+  // A slab is thin compared with the cell; a bulk with a long axis (e.g. a
+  // cuprate with c = 27 A) fills most of it even if no bond crosses the cell
+  // boundary in the bond list.  Require at least ~40% vacuum.
+  const thickness=(mx-mn)*L[longest];
+  if(thickness > 0.6*L[longest]) return {is2D:false};
   return {
     is2D:true,
     normalAxis:longest,
     inPlane:order.slice(1).sort((a,b)=>a-b),
     vacuumLen:L[longest],
-    slabThickness:(mx-mn)*L[longest],
+    slabThickness:thickness,
   };
 }
 
@@ -2106,12 +2151,16 @@ function run(){
   syncParams();      // rebuild the parameter sliders for the new basis/model
   // Compute the bands FIRST, so the Model tab (H(k), state chips, counts) is
   // rendered against the fresh LASTBANDS rather than the previous structure's.
-  // Quick low-resolution pass first, full resolution after a short idle: a
-  // large basis no longer blocks the UI while the plot is computed.
-  renderBands(true,true); // new deck/basis → re-fit the energy window
+  // A new deck/basis: with the workers one full pass is cheaper than a quick
+  // preview plus the full pass, so do not render the bands twice.
+  if(singleBandPass()){
+    renderBands(true,false);   // re-fit the energy window
+  } else {
+    renderBands(true,true);
+    scheduleFullRender();
+  }
   renderModel();
   draw();
-  scheduleFullRender();
 }
 
 function syncParams(){
@@ -2133,6 +2182,9 @@ function renderStructureTables(){
   h+=`<div class="stat"><span class="k">cell a,b,c (Å)</span><b>${fmt(cp.a,3)} ${fmt(cp.b,3)} ${fmt(cp.c,3)}</b></div>`;
   h+=`<div class="stat"><span class="k">angles α,β,γ (°)</span><b>${fmt(cp.alpha,2)} ${fmt(cp.beta,2)} ${fmt(cp.gamma,2)}</b></div>`;
   h+=`<div class="stat"><span class="k">sites / orbitals</span><b>${ST.sites.length} / ${ST.nOrbitals}</b></div>`;
+  if(ST.nAsym && ST.nAsym<ST.sites.length){
+    h+=`<div class="stat"><span class="k">asymmetric → full cell</span><b>${ST.nAsym} → ${ST.sites.length} sites (CIF symmetry)</b></div>`;
+  }
   h+=`<div class="stat"><span class="k">bonds (ordered)</span><b>${NB.bonds.length} @ ${NB.cutoff.toFixed(3)} Å</b></div>`;
   $('subTitle').textContent=`${ST.sites.length} sites · ${ST.nOrbitals} orbitals · ${NB.bonds.length} bonds`;
 }
@@ -2329,6 +2381,73 @@ function filterStructureByStates(st){
   if(sites.length===0) return st;   // guard: never produce an empty basis
   return Object.assign({},st,{sites,nOrbitals:g});
 }
+/* ---- parallel band computation (Web Workers) ------------------------------
+   The k-points are independent: the main thread builds H(k) and the workers
+   diagonalise it.  The worker code is the SAME Householder+QL eigensolver,
+   serialised from the functions above, so there is no second implementation
+   to keep in sync.  Blob workers need an http(s) origin; on file:// the
+   constructor throws, the option is disabled and the single-thread path runs. */
+const PARALLEL_MIN_ORBITALS=40;
+let BAND_POOL=null, BAND_TOKEN=0, BAND_PENDING=false;
+function parallelEnabled(){
+  const cb=$('useWorkers');
+  return !!(cb && cb.checked && typeof Worker!=='undefined');
+}
+/* With the workers a single full pass is cheaper than a quick preview followed
+   by the full pass; for the interactive slider drags the quick pass stays. */
+function singleBandPass(){
+  return parallelEnabled() && ST && ST.nOrbitals>=PARALLEL_MIN_ORBITALS;
+}
+function bandPool(){
+  if(BAND_POOL) return BAND_POOL;
+  try{
+    const src=[
+      '"use strict";',
+      hermitianEigenvaluesF.toString(),
+      _tred2.toString(),
+      _tql2.toString(),
+      'self.onmessage=function(e){',
+      '  const d=e.data;',
+      '  const ev=hermitianEigenvaluesF(d.re,d.im,d.n);',
+      '  self.postMessage({run:d.run,id:d.id,ev:ev});',
+      '};',
+    ].join('\n');
+    const url=URL.createObjectURL(new Blob([src],{type:'text/javascript'}));
+    const n=Math.max(1,Math.min(12,(navigator.hardwareConcurrency||4)-1));
+    const workers=[];
+    for(let i=0;i<n;i++)workers.push(new Worker(url));
+    BAND_POOL={workers,n,url};
+  }catch(err){
+    BAND_POOL={workers:[],n:0,error:String(err)};
+  }
+  return BAND_POOL;
+}
+function computeBandsWorkers(kpts,mst,mnb,params,token){
+  const pool=bandPool();
+  if(!pool.workers.length)return Promise.reject(new Error(pool.error||'workers unavailable'));
+  const run=token;
+  return new Promise((resolve,reject)=>{
+    const bands=new Array(kpts.length);
+    let next=0,done=0;
+    const feed=(w)=>{
+      if(run!==BAND_TOKEN)return;
+      if(next>=kpts.length)return;
+      const i=next++;
+      const H=buildHk(mst,mnb,params,kpts[i].k);
+      w.postMessage({run,id:i,n:H.n,re:H.re,im:H.im},[H.re.buffer,H.im.buffer]);
+    };
+    for(const w of pool.workers){
+      w.onmessage=(e)=>{
+        if(e.data.run!==run)return;
+        bands[e.data.id]=e.data.ev;
+        if(++done===kpts.length)resolve(bands); else feed(w);
+      };
+      w.onerror=(e)=>reject(e.error||new Error('worker error'));
+      feed(w);
+    }
+    if(!kpts.length)resolve(bands);
+  });
+}
 function renderBands(resetView, quick){
   const kind=$('modelSel').value;
   let mst=modelStructure(kind);
@@ -2343,11 +2462,42 @@ function renderBands(resetView, quick){
   // follows automatically after a short idle (see scheduleFullRender).
   if(quick) perSeg=Math.max(6, Math.round(perSeg/4));
   const {kpts,segs,total}=samplePath(nodes,perSeg);
-  // (k-point count is shown in the k-path panel below)
+  const token=++BAND_TOKEN;
+
+  const apply=(bands,elapsed,nWorkers)=>{
+    if(token!==BAND_TOKEN)return;
+    BAND_PENDING=false;
+    LASTBANDS={bands,kpts,segs,total,nBands:mst.nOrbitals,kind,mst,mnb,params,quick:!!quick};
+    LASTBANDS.bandRange=bands.map(b=>{
+      let lo=Infinity,hi=-Infinity;
+      for(const e of b){ if(e<lo)lo=e; if(e>hi)hi=e; }
+      return [lo,hi];
+    });
+    // Fermi level from electron counting (drawn as a dashed line; can be set to 0)
+    FERMI=computeFermi(LASTBANDS,mst);
+    renderBandsFinish(resetView,kind,mst,mnb,params,kpts,nodes,elapsed,nWorkers);
+  };
+
+  if(parallelEnabled() && mst.nOrbitals>=PARALLEL_MIN_ORBITALS && kpts.length>1){
+    const t0=performance.now();
+    BAND_PENDING=true;
+    if($('bandNote2'))$('bandNote2').textContent=`computing ${kpts.length} k × ${mst.nOrbitals} orbitals…`;
+    computeBandsWorkers(kpts,mst,mnb,params,token).then(bands=>{
+      apply(bands,Math.round(performance.now()-t0),bandPool().n);
+    }).catch(err=>{
+      const cb=$('useWorkers'); if(cb)cb.checked=false;
+      const t1=performance.now();
+      const bands=kpts.map(pt=>eigenvaluesHk(buildHk(mst,mnb,params,pt.k)));
+      apply(bands,Math.round(performance.now()-t1),0);
+      if($('bandNote2'))$('bandNote2').innerHTML+=' · workers unavailable: '+err.message;
+    });
+    return;
+  }
   const bands=kpts.map(pt=>eigenvaluesHk(buildHk(mst,mnb,params,pt.k)));
-  LASTBANDS={bands,kpts,segs,total,nBands:mst.nOrbitals,kind,mst,mnb,params,quick:!!quick};
-  // Fermi level from electron counting (drawn as a dashed line; can be set to 0)
-  FERMI=computeFermi(LASTBANDS,mst);
+  apply(bands,0,0);
+}
+/* Everything after the eigenvalues: LASTBANDS/FERMI are set by the caller. */
+function renderBandsFinish(resetView,kind,mst,mnb,params,kpts,nodes,elapsed,nWorkers){
   // update the k-path info panel (lattice class + points)
   const slab=currentSlab();
   const cls=slab.is2D ? lattice2DClass(
@@ -2373,6 +2523,12 @@ function renderBands(resetView, quick){
   }
   drawBands();
   renderValidation(kind,mst,mnb,params);
+  if(nWorkers && $('bandNote2')){
+    $('bandNote2').innerHTML+=` · ${elapsed} ms · ${nWorkers} workers`;
+  }
+  if(nWorkers && $('tab-model') && !$('tab-model').classList.contains('hidden')){
+    renderModel();   // the H(k) panel is built from LASTBANDS
+  }
 }
 function renderValidation(kind,mst,mnb,params){
   const box=$('valBox');
@@ -3124,6 +3280,56 @@ function siteTip(){
       draw();
     });
     cv.addEventListener('mouseleave',()=>{hoverBond=null;if(info)info.textContent='';siteTip().classList.remove('on');draw();});
+    // touch: one finger rotates (3-D) or pans (2-D), two fingers pinch-zoom,
+    // a tap selects the atom under the finger (D-25)
+    let tStart=null, tPinch=0;
+    cv.addEventListener('touchstart',e=>{
+      if(e.touches.length===1){
+        const t0=e.touches[0];
+        tStart={x:t0.clientX,y:t0.clientY,moved:false};
+        cv.dataset.pressX=t0.clientX; cv.dataset.pressY=t0.clientY;
+        if(window.__is3D){VIEW3D.dragging=true;VIEW3D.lx=t0.clientX;VIEW3D.ly=t0.clientY;}
+        else {VIEW.dragging=true;VIEW.lx=t0.clientX;VIEW.ly=t0.clientY;}
+      } else if(e.touches.length===2){
+        const [a,b]=e.touches;
+        tPinch=Math.hypot(a.clientX-b.clientX,a.clientY-b.clientY);
+      }
+      e.preventDefault();
+    },{passive:false});
+    cv.addEventListener('touchmove',e=>{
+      if(e.touches.length===1 && tStart){
+        const t0=e.touches[0];
+        if(Math.abs(t0.clientX-tStart.x)+Math.abs(t0.clientY-tStart.y)>4) tStart.moved=true;
+        if(window.__is3D){
+          VIEW3D.rotY+=(t0.clientX-VIEW3D.lx)*0.01;
+          VIEW3D.rotX+=(t0.clientY-VIEW3D.ly)*0.01;
+          VIEW3D.rotX=Math.max(-1.5,Math.min(1.5,VIEW3D.rotX));
+          VIEW3D.lx=t0.clientX;VIEW3D.ly=t0.clientY;
+        } else {
+          VIEW.ox+=t0.clientX-VIEW.lx; VIEW.oy+=t0.clientY-VIEW.ly;
+          VIEW.lx=t0.clientX; VIEW.ly=t0.clientY;
+        }
+        draw();
+      } else if(e.touches.length===2){
+        const [a,b]=e.touches;
+        const d=Math.hypot(a.clientX-b.clientX,a.clientY-b.clientY);
+        if(tPinch>0){
+          const f=d/tPinch;
+          if(window.__is3D) VIEW3D.scale=Math.max(0.2,Math.min(6,VIEW3D.scale*f));
+          else VIEW.scale=Math.max(0.2,Math.min(6,VIEW.scale*f));
+          draw();
+        }
+        tPinch=d;
+      }
+      e.preventDefault();
+    },{passive:false});
+    cv.addEventListener('touchend',e=>{
+      if(e.touches.length) return;
+      if(tStart && !tStart.moved){
+        cv.dispatchEvent(new MouseEvent('mouseup',{clientX:tStart.x,clientY:tStart.y,bubbles:true}));
+      }
+      tStart=null; tPinch=0; VIEW.dragging=false; VIEW3D.dragging=false;
+    });
   }
   window.addEventListener('mouseup',()=>{VIEW.dragging=false;VIEW3D.dragging=false;});
   window.addEventListener('mousemove',e=>{
@@ -3539,33 +3745,54 @@ function drawBZ(){
   $('bzPath').textContent=nodes.map(n=>n.label).join('–');
 }
 
-function drawBands(){
+function drawBands(fast){
   if(!LASTBANDS)return;
   for(const id of ['bcv','bcv2','bcv3']){
     const el=$(id);
-    if(el && el.offsetParent!==null) drawBandsOne(id);
+    if(el && el.offsetParent!==null) drawBandsOne(id,fast);
   }
   const mn=$('modelBandNote');
   if(mn) mn.textContent=LASTBANDS.nBands+' bands';
 }
-function drawBandsOne(canvasId){
-  if(!LASTBANDS)return;
-  const {bands,kpts,segs,total,nBands}=LASTBANDS;
-  const cv=$(canvasId), wrap=cv.parentElement;
-  if(!cv) return;
-  const dpr=window.devicePixelRatio||1;
-  const W=wrap.clientWidth||600,H=wrap.clientHeight||320;
-  cv.width=W*dpr;cv.height=H*dpr;
-  const ctx=cv.getContext('2d');
-  ctx.setTransform(dpr,0,0,dpr,0,0);
+/* During a pan/zoom the same bands are redrawn many times per second.  Use a
+   cheap pass (no PCHIP smoothing, no note DOM updates) on the next animation
+   frame, then one full pass after the interaction settles. */
+let _bandFastRaf=null, _bandFastTimer=null;
+function drawBandsFast(){
+  if(_bandFastRaf) return;
+  _bandFastRaf=requestAnimationFrame(()=>{ _bandFastRaf=null; drawBands(true); });
+  clearTimeout(_bandFastTimer);
+  _bandFastTimer=setTimeout(()=>drawBands(false),180);
+}
+let _bandTheme=null, _bandThemeKey=null;
+function bandTheme(){
+  const key=document.documentElement.getAttribute('data-theme')||'';
+  if(_bandTheme && _bandThemeKey===key) return _bandTheme;
   const css=getComputedStyle(document.documentElement);
-  const T={
+  _bandTheme={
     canvas:css.getPropertyValue('--canvas').trim(),
     grid:css.getPropertyValue('--line2').trim(),
     axis:css.getPropertyValue('--line').trim(),
     txt:css.getPropertyValue('--fg3').trim(),
     fg:css.getPropertyValue('--fg').trim(),
   };
+  _bandThemeKey=key;
+  return _bandTheme;
+}
+function drawBandsOne(canvasId, fast){
+  if(!LASTBANDS)return;
+  const {bands,kpts,segs,total,nBands}=LASTBANDS;
+  const cv=$(canvasId), wrap=cv.parentElement;
+  if(!cv) return;
+  const dpr=window.devicePixelRatio||1;
+  const W=wrap.clientWidth||600,H=wrap.clientHeight||320;
+  // Resizing a canvas (even to the same size) resets the context and the
+  // backing store; only do it when the size actually changed.
+  const wpx=Math.round(W*dpr), hpx=Math.round(H*dpr);
+  if(cv.width!==wpx||cv.height!==hpx){cv.width=wpx;cv.height=hpx;}
+  const ctx=cv.getContext('2d');
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  const T=bandTheme();
   ctx.fillStyle=T.canvas; ctx.fillRect(0,0,W,H);
 
   // E_F reference: when "set E_F = 0" is on, shift every energy by -E_F so the
@@ -3631,18 +3858,49 @@ function drawBandsOne(canvasId){
   const bounds=[0];
   for(const sg of segs){ bounds.push(kpts.findIndex(k=>k.s>=sg.b-1e-9)); }
   if(bounds[bounds.length-1]<0) bounds[bounds.length-1]=kpts.length-1;
+  // A dense path (the default 60 points/segment gives 541 k-points) is already
+  // smooth; PCHIP would turn it into ~10x more points for no visible gain.
+  // During a pan/zoom (fast) skip it too, and cull bands outside the window.
+  const useSmooth=!fast && kpts.length<=240;
+  const cull=(emax-emin)*0.02;
+  const ranges=LASTBANDS.bandRange;
   for(let bnd=0;bnd<nBands;bnd++){
+    let bmin,bmax;
+    if(ranges && ranges[bnd]){ bmin=ranges[bnd][0]-shift; bmax=ranges[bnd][1]-shift; }
+    else {
+      bmin=Infinity; bmax=-Infinity;
+      for(let i=0;i<bands.length;i++){
+        const e=bands[i][bnd]-shift;
+        if(e<bmin)bmin=e; if(e>bmax)bmax=e;
+      }
+    }
+    if(bmax<emin-cull || bmin>emax+cull) continue;
     ctx.strokeStyle=BANDCOLORS[bnd%BANDCOLORS.length];
     ctx.lineWidth=1.8;
     for(let sIdx=0;sIdx<bounds.length-1;sIdx++){
       const a=bounds[sIdx], b=bounds[sIdx+1];
       if(b<=a) continue;
-      // build smooth polyline through the samples of this segment
-      const xs=[],ys=[];
-      for(let i=a;i<=b;i++){ xs.push(X(kpts[i].s)); ys.push(Y(bands[i][bnd])); }
-      const sm=smoothPolyline(xs,ys);
+      if(useSmooth){
+        const xs=[],ys=[];
+        for(let i=a;i<=b;i++){ xs.push(X(kpts[i].s)); ys.push(Y(bands[i][bnd])); }
+        const sm=smoothPolyline(xs,ys);
+        ctx.beginPath();
+        for(let i=0;i<sm.x.length;i++){ if(i===0)ctx.moveTo(sm.x[i],sm.y[i]); else ctx.lineTo(sm.x[i],sm.y[i]); }
+        ctx.stroke();
+      }
+    }
+    if(!useSmooth){
+      // dense data: one polyline for the whole band (the k-points are
+      // continuous across the high-symmetry corners; a single stroke is much
+      // cheaper than one per segment)
+      const stride=Math.max(1,Math.ceil(kpts.length/(pr.w*2)));
       ctx.beginPath();
-      for(let i=0;i<sm.x.length;i++){ if(i===0)ctx.moveTo(sm.x[i],sm.y[i]); else ctx.lineTo(sm.x[i],sm.y[i]); }
+      let first=true;
+      for(let i=0;i<kpts.length;i+=stride){
+        const xx=X(kpts[i].s), yy=Y(bands[i][bnd]);
+        if(first){ctx.moveTo(xx,yy);first=false;} else ctx.lineTo(xx,yy);
+      }
+      if((kpts.length-1)%stride) ctx.lineTo(X(kpts[kpts.length-1].s),Y(bands[kpts.length-1][bnd]));
       ctx.stroke();
     }
   }
@@ -3738,15 +3996,17 @@ function drawBandsOne(canvasId){
 
   // The band note is rendered as HTML so the Fermi subscript is upright
   // (E<sub>F</sub>), matching the axis label.
-  let note=`${nBands} bands · ${emin.toFixed(2)}…${emax.toFixed(2)} eV`;
-  if(FERMI && FERMI.ef!==null){
-    const efShow=FERMI.ef-shift;
-    const gapTxt=(FERMI.gap!=null && FERMI.gap>1e-6)?`, gap ${FERMI.gap.toFixed(2)} eV`:'';
-    note+=` · E<sub>F</sub> ${efShow.toFixed(2)} eV${gapTxt}`;
+  if(!fast && !BAND_PENDING){
+    let note=`${nBands} bands · ${emin.toFixed(2)}…${emax.toFixed(2)} eV`;
+    if(FERMI && FERMI.ef!==null){
+      const efShow=FERMI.ef-shift;
+      const gapTxt=(FERMI.gap!=null && FERMI.gap>1e-6)?`, gap ${FERMI.gap.toFixed(2)} eV`:'';
+      note+=` · E<sub>F</sub> ${efShow.toFixed(2)} eV${gapTxt}`;
+    }
+    if($('bandNote'))$('bandNote').innerHTML=note;
+    if($('bandNote2'))$('bandNote2').innerHTML=note;
+    if($('modelBandNote'))$('modelBandNote').innerHTML=nBands+' bands · '+emin.toFixed(1)+'…'+emax.toFixed(1)+' eV'+((FERMI&&FERMI.ef!==null)?(' · E<sub>F</sub> '+(FERMI.ef-shift).toFixed(1)):'');
   }
-  if($('bandNote'))$('bandNote').innerHTML=note;
-  if($('bandNote2'))$('bandNote2').innerHTML=note;
-  if($('modelBandNote'))$('modelBandNote').innerHTML=nBands+' bands · '+emin.toFixed(1)+'…'+emax.toFixed(1)+' eV'+((FERMI&&FERMI.ef!==null)?(' · E<sub>F</sub> '+(FERMI.ef-shift).toFixed(1)):'');
 }
 
 /* ---------- band interaction: ENERGY-only pan / zoom / reset ---------- */
@@ -3772,7 +4032,7 @@ function drawBandsOne(canvasId){
       const f=Math.exp(e.deltaY*0.0015);
       BVIEW.e0=eAt+(BVIEW.e0-eAt)*f;
       BVIEW.e1=eAt+(BVIEW.e1-eAt)*f;
-      clampE(); drawBands();
+      clampE(); drawBandsFast();
     },{passive:false});
     cv.addEventListener('dblclick',()=>{
       BVIEW.userRange=false; BVIEW.e0=null; BVIEW.e1=null;
@@ -3780,6 +4040,37 @@ function drawBandsOne(canvasId){
       if($('eLo'))$('eLo').disabled=true; if($('eHi'))$('eHi').disabled=true;
       drawBands();
     });
+    // touch: one finger pans energy, two fingers pinch-zoom (D-25)
+    let tDrag=null, tPinch=0;
+    cv.addEventListener('touchstart',e=>{
+      if(e.touches.length===1) tDrag={y:e.touches[0].clientY,e0:BVIEW.e0,e1:BVIEW.e1};
+      else if(e.touches.length===2){const [a,b]=e.touches;tPinch=Math.hypot(a.clientX-b.clientX,a.clientY-b.clientY);}
+      e.preventDefault();
+    },{passive:false});
+    cv.addEventListener('touchmove',e=>{
+      if(!LASTBANDS) return;
+      const pr=bandPlotRect(cv.clientWidth,cv.clientHeight);
+      if(e.touches.length===1 && tDrag){
+        const dy=e.touches[0].clientY-tDrag.y;
+        const perPx=(tDrag.e1-tDrag.e0)/pr.h;
+        BVIEW.e0=tDrag.e0+dy*perPx; BVIEW.e1=tDrag.e1+dy*perPx;
+        clampE(); drawBandsFast();
+      } else if(e.touches.length===2){
+        const [a,b]=e.touches;
+        const d=Math.hypot(a.clientX-b.clientX,a.clientY-b.clientY);
+        if(tPinch>0){
+          const r=cv.getBoundingClientRect();
+          const my=(a.clientY+b.clientY)/2-r.top;
+          const eAt=BVIEW.e1-(my-pr.y)/pr.h*(BVIEW.e1-BVIEW.e0);
+          const f=tPinch/d;
+          BVIEW.e0=eAt+(BVIEW.e0-eAt)*f; BVIEW.e1=eAt+(BVIEW.e1-eAt)*f;
+          clampE(); drawBandsFast();
+        }
+        tPinch=d;
+      }
+      e.preventDefault();
+    },{passive:false});
+    cv.addEventListener('touchend',e=>{ if(!e.touches.length){tDrag=null;tPinch=0;} });
   }
   wire($('bcv')); wire($('bcv2')); wire($('bcv3'));
   window.addEventListener('mouseup',()=>{drag=null;document.querySelectorAll('canvas').forEach(c=>c.style.cursor='');});
@@ -3791,7 +4082,7 @@ function drawBandsOne(canvasId){
       const dy=(e.clientY-drag.y);
       BVIEW.e0=drag.e0+dy*perPx;
       BVIEW.e1=drag.e1+dy*perPx;
-      clampE(); drawBands();
+      clampE(); drawBandsFast();
       return;
     }
     // hover readout (on whichever band canvas the cursor is over)
@@ -3841,6 +4132,45 @@ function drawBandsOne(canvasId){
     BZVIEW.scale=Math.max(0.4,Math.min(4,BZVIEW.scale));
     drawBZ();
   },{passive:false});
+  // touch: one finger rotates, two fingers pinch-zoom, tap selects a label
+  let tStart=null, tPinch=0;
+  cv.addEventListener('touchstart',e=>{
+    if(e.touches.length===1){
+      const t0=e.touches[0];
+      tStart={x:t0.clientX,y:t0.clientY,moved:false};
+      dragging=true; BZVIEW.lx=t0.clientX; BZVIEW.ly=t0.clientY;
+    } else if(e.touches.length===2){
+      const [a,b]=e.touches; tPinch=Math.hypot(a.clientX-b.clientX,a.clientY-b.clientY);
+    }
+    e.preventDefault();
+  },{passive:false});
+  cv.addEventListener('touchmove',e=>{
+    if(e.touches.length===1 && tStart){
+      const t0=e.touches[0];
+      if(Math.abs(t0.clientX-tStart.x)+Math.abs(t0.clientY-tStart.y)>4) tStart.moved=true;
+      BZVIEW.rotY+=(t0.clientX-BZVIEW.lx)*0.01;
+      BZVIEW.rotX+=(t0.clientY-BZVIEW.ly)*0.01;
+      BZVIEW.rotX=Math.max(-1.5,Math.min(1.5,BZVIEW.rotX));
+      BZVIEW.lx=t0.clientX; BZVIEW.ly=t0.clientY;
+      drawBZ();
+    } else if(e.touches.length===2){
+      const [a,b]=e.touches;
+      const d=Math.hypot(a.clientX-b.clientX,a.clientY-b.clientY);
+      if(tPinch>0){
+        BZVIEW.scale=Math.max(0.4,Math.min(4,BZVIEW.scale*(d/tPinch)));
+        drawBZ();
+      }
+      tPinch=d;
+    }
+    e.preventDefault();
+  },{passive:false});
+  cv.addEventListener('touchend',e=>{
+    if(e.touches.length) return;
+    if(tStart && !tStart.moved){
+      cv.dispatchEvent(new MouseEvent('click',{clientX:tStart.x,clientY:tStart.y,bubbles:true}));
+    }
+    tStart=null; tPinch=0; dragging=false;
+  });
   cv.addEventListener('click',e=>{
     if(!window.__bzScreenPts)return;
     const r=cv.getBoundingClientRect();
@@ -4104,9 +4434,13 @@ function updateBasisDirtyUI(){
 function recomputeBasis(){
   BASIS_DIRTY=false;
   updateBasisDirtyUI();
-  renderBands(true,true);    // quick pass, full resolution follows after idle
+  if(singleBandPass()){
+    renderBands(true,false);
+  } else {
+    renderBands(true,true);  // quick pass, full resolution follows after idle
+    scheduleFullRender();
+  }
   renderModel();
-  scheduleFullRender();
 }
 /* ===========================================================================
    SYMBOLIC H(k)
@@ -4624,9 +4958,13 @@ function renderModel(){
       const chip=cb.closest('.statechip');
       if(chip) chip.classList.toggle('off', !cb.checked);
       if(basisAutoRecompute()){
-        // immediate: re-diagonalise now (quick pass, then full resolution)
-        renderBands(false,true); renderModel();
-        scheduleFullRender();
+        // immediate: re-diagonalise now (one full pass with the workers)
+        if(singleBandPass()){
+          renderBands(false,false); renderModel();
+        } else {
+          renderBands(false,true); renderModel();
+          scheduleFullRender();
+        }
       } else {
         // manual: keep the current bands; flag the pending change
         markBasisDirty();
@@ -4824,7 +5162,8 @@ $('cifFile').addEventListener('change',e=>{
       run();
       // report what symmetry was found
       const n=ST.hasSymmetry?ST.symops.length:0;
-      $('importNote').textContent=f.name+' · '+(n?n+' symops':'no symmetry');
+      $('importNote').textContent=f.name+' · '+(n?n+' symops':'no symmetry')+
+        (ST.nAsym&&ST.nAsym<ST.sites.length?' · '+ST.nAsym+'→'+ST.sites.length+' sites':'');
     }catch(err){
       alert('Could not read that CIF: '+err.message);
       CURRENT_CIF=null; CURRENT_CIF_NAME=null;
@@ -4886,6 +5225,13 @@ if($('selAtom')) $('selAtom').addEventListener('change',updateSelCount);
 if($('selShell')) $('selShell').addEventListener('change',updateSelCount);
 if($('recomputeBtn')) $('recomputeBtn').addEventListener('click',()=>{ recomputeBasis(); });
 $('pathSel').addEventListener('change',()=>{if($('pathSel').value!=='custom')CUSTOM_PATH=null;renderBands(true);drawBZ();});
+if($('useWorkers')) $('useWorkers').addEventListener('change',()=>{ renderBands(true); });
+if($('useWorkers')){
+  const qp=new URLSearchParams(location.search).get('workers');
+  if(qp==='1') $('useWorkers').checked=true;
+  else if(qp==='0') $('useWorkers').checked=false;
+  else if(location.protocol!=='file:' && (navigator.hardwareConcurrency||1)>1) $('useWorkers').checked=true;
+}
 $('perSeg').addEventListener('change',()=>{renderBands(true);});
 if($('btExportModel')) $('btExportModel').addEventListener('click',exportModelJSON);
 $('autoRange').addEventListener('change',()=>{
@@ -4947,8 +5293,9 @@ function renderLegend(){
 
 /* init theme + run */
 (function init(){
-  let t='dark';
-  try{t=localStorage.getItem('skbuilder-theme')||'dark';}catch(e){}
+  let t=null;
+  try{t=localStorage.getItem('skbuilder-theme');}catch(e){}
+  if(!t) t = (window.matchMedia && matchMedia('(prefers-color-scheme: light)').matches) ? 'light' : 'dark';
   applyTheme(t);
   $('eLo').disabled=true; $('eHi').disabled=true;
   run();
