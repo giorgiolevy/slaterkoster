@@ -3,7 +3,7 @@
   Slater-Koster model builder
    --------------------------
 
-  Version: 1.0.15
+  Version: 1.0.18
 
   A single-file, dependency-free Slater-Koster model builder.  Load a
   structure (CIF, e.g. exported from CrystalViewer), pick an orbital basis,
@@ -330,7 +330,7 @@ tr:hover td{background:var(--accent-soft)}
       <div class="glyph">⬡</div>
       <div>
         <div class="t1">Slater–Koster</div>
-        <div class="t2">CIF → structure → H(k) → bands · v1.0.17</div>
+        <div class="t2">CIF → structure → H(k) → bands · v1.0.18</div>
       </div>
       <div class="spacer"></div>
       <button id="themeBtn" title="Switch day / night appearance" aria-label="Toggle theme">☾</button>
@@ -857,6 +857,7 @@ const DEFAULT_SHELLS={
   Na:[0,1],Mg:[0],Al:[0,1],Si:[0,1],P:[0,1],S:[0,1],Cl:[0,1],
   K:[0,1],Ca:[0],Ga:[0,1],Ge:[0,1],As:[0,1],Se:[0,1],Br:[0,1],
   Sc:[0,2],Ti:[0,2],V:[0,2],Cr:[0,2],Mn:[0,2],Fe:[0,2],Co:[0,2],Ni:[0,2],Cu:[0,2],Zn:[0,2],
+  Sr:[0],Ba:[0],Y:[0,2],La:[0,2],
 };
 const defaultShells=el=>DEFAULT_SHELLS[el]?DEFAULT_SHELLS[el].slice():[0];
 
@@ -997,6 +998,7 @@ const VALENCE_E = {
   Ga:3, Ge:4, As:5, Se:6, Br:7, Kr:8,
   Rb:1, Sr:2, Y:3, Zr:4, Nb:5, Mo:6, Tc:7, Ru:8, Rh:9, Pd:10, Ag:11, Cd:12,
   In:3, Sn:4, Sb:5, Te:6, I:7, Xe:8,
+  Cs:1, Ba:2, La:3,
 };
 function valenceElectrons(el){
   return (VALENCE_E[el]!==undefined)?VALENCE_E[el]:1;
@@ -1207,30 +1209,41 @@ function _bondInt(l1,m1,l2,m2,mn,V){
   const C=_bondFrameCoeffs(R);
   const ia=_orbIndex(l1,m1), ib=_orbIndex(l2,m2);
   if(ia<0||ib<0) return 0;
-  // E = sum over bond-frame channel b of C_a[b] * (channel V) * C_b[b]
   // Bond-frame channel of an orbital with angular momentum l and index m:
   //   p (l=1): m=0 (z) -> sigma ; m=1 (x),2 (y) -> pi
   //   d (l=2): m=2 (z2) -> sigma ; m=1 (yz),3 (xz) -> pi ; m=0 (xy),4 (x2-y2) -> delta
+  // The two-centre integral is DIAGONAL in the bond-frame orbital: a bond-frame
+  // orbital of l1 pairs only with the bond-frame orbital of l2 that carries
+  // the same ORIENTATION LABEL, not with every orbital of the channel:
+  //   p-d: p_z'<->d_z2' (sigma), p_x'<->d_xz' (pi), p_y'<->d_yz' (pi); the p has
+  //        no delta partner (l=1 < |m|=2), so p-d has no delta term.
+  //   d-d: each bond-frame d pairs with itself.
+  // Matching by channel ALONE (the old form summed over all pairs that share a
+  // channel) couples p_x'<->d_yz' and d_xy'<->d_x2-y2' too: those two-centre
+  // integrals are spurious.  On the z axis E(p_x,d_yz), E(d_xz,d_yz) and
+  // E(d_xy,d_x2-y2) came out as V_pd_pi, V_dd_pi, V_dd_delta instead of 0,
+  // which flattens whole manifolds (e.g. O-d in LaNiO3) and breaks the cubic
+  // degeneracies.  The rotational sum rule holds for BOTH forms (it only counts
+  // channel weights), so the zero-structure checks in the tests are what pins
+  // this down.
   const chan=(l,m)=>{
     if(l===0) return 0;                       // s: sigma
     if(l===1) return (m===0)?0:1;             // p: z'=sigma, x'/y'=pi
     if(l===2) return (m===2)?0:((m===1||m===3)?1:2);
     return 0;
   };
-  // Sum over bond-frame orbital PAIRS (b1 of l1, b2 of l2) that share a channel.
-  // The two orbitals generally have different l, so they cannot share the same
-  // bond-frame index; we match them by channel instead.
+  // bond-frame index: p_z->d_z2, p_x->d_xz, p_y->d_yz (indices in _ORBIDX)
+  const PD_PARTNER={1:6, 2:7, 3:5};
   let e=0;
-  for(let b1=0;b1<9;b1++){
-    const o1=_ORBIDX[b1];
-    if(o1[0]!==l1) continue;
-    const ch1=chan(o1[0],o1[1]);
-    for(let b2=0;b2<9;b2++){
-      const o2=_ORBIDX[b2];
-      if(o2[0]!==l2) continue;
-      if(chan(o2[0],o2[1])!==ch1) continue;
-      e += C[ia][b1]*_channelV(l1,l2,ch1,V)*C[ib][b2];
-    }
+  if(l1===2&&l2===2){
+    for(let b=4;b<=8;b++)                     // the five bond-frame d orbitals
+      e += C[ia][b]*_channelV(2,2,chan(2,_ORBIDX[b][1]),V)*C[ib][b];
+  }else if(l1===1&&l2===2){
+    for(let b=1;b<=3;b++)                     // the three bond-frame p orbitals
+      e += C[ia][b]*_channelV(1,2,chan(1,_ORBIDX[b][1]),V)*C[ib][PD_PARTNER[b]];
+  }else{
+    for(let b=1;b<=3;b++)
+      e += C[ia][PD_PARTNER[b]]*_channelV(2,1,chan(1,_ORBIDX[b][1]),V)*C[ib][b];
   }
   return sign*e;
 }
@@ -2075,20 +2088,25 @@ document.querySelectorAll('.subtab[data-hk]').forEach(b=>{
 
 
 /* ---------- main run ---------- */
-function basisShells(){
+function basisShells(text){
   const b=$('basisSel').value;
   if(b==='auto')return {};
   const map={s:[0],p:[1],d:[2],sp:[0,1],pd:[1,2],spd:[0,1,2]};
   const ls=map[b]||[0];
   const out={};
-  // apply to every element present in the deck
-  for(const el of Object.keys(DEFAULT_SHELLS))out[el]=ls;
+  // Apply to every element present in the loaded CIF/deck, not only to the
+  // elements with a DEFAULT_SHELLS entry.  La, for example, has no entry, so
+  // "p + d" used to leave La at its s-only fallback (a dead orbital at the
+  // imported-lattice onsite energy) although the user asked for p+d everywhere.
+  let els=[];
+  try{ els=[...new Set(parseCIF(text).atoms.map(a=>a.el))]; }catch(e){}
+  if(!els.length) els=Object.keys(DEFAULT_SHELLS);
+  for(const el of els)out[el]=ls;
   return out;
 }
 let CURRENT_CIF=null;   // text of an imported CIF (null = use the deck dropdown)
 function run(){
   const name=$('deckSel').value;
-  const shells=basisShells();
   let text, label;
   if(CURRENT_CIF!==null){
     text=CURRENT_CIF; label=CURRENT_CIF_NAME||$('importNote').textContent||'imported.cif';
@@ -2096,6 +2114,7 @@ function run(){
     text=DECKS[name]; label=name;
   }
   if(!text){ return; }   /* sentinel selected with nothing imported yet: nothing to load */
+  const shells=basisShells(text);   // needs the text: the basis follows the loaded elements
   $('deckName').textContent=label;
   // A new structure invalidates the previous state selection: the site/orbital
   // indices in HIDDEN_STATES refer to the OLD structure, so clearing them here
